@@ -2,12 +2,12 @@ import os
 import json
 import logging
 import asyncio
-import schedule
-import time
-import threading
+import base64
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # Налаштування логування
 logging.basicConfig(
@@ -25,12 +25,11 @@ class SimpleBroadcastBot:
     def __init__(self, token):
         self.token = token
         self.application = Application.builder().token(token).build()
+        self.scheduler = AsyncIOScheduler()
         self.setup_handlers()
         self.load_data()
         self.broadcast_in_progress = False
         self.auto_broadcast_active = False
-        self.schedule_thread = None
-        self.stop_schedule = False
         self.current_message_index = 0
         
     def setup_handlers(self):
@@ -127,45 +126,27 @@ class SimpleBroadcastBot:
             logger.error(f"Помилка в is_admin: {e}")
             return False
 
-    def start_auto_broadcast(self):
+    async def start_auto_broadcast(self):
         """Запуск автоматичної розсилки"""
-        def auto_broadcast_job():
-            try:
-                if self.auto_broadcast_active and self.messages and self.groups:
-                    logger.info("🔄 Автоматична розсилка запущена")
-                    # Створюємо новий event loop для кожного виконання
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(self.single_auto_broadcast())
-                    except Exception as e:
-                        logger.error(f"Помилка в автоматичній розсилці: {e}")
-                    finally:
-                        loop.close()
-            except Exception as e:
-                logger.error(f"Помилка в auto_broadcast_job: {e}")
-
-        # Очищаємо старий розклад
-        schedule.clear()
-        self.stop_schedule = False
+        if self.auto_broadcast_active:
+            logger.info("Авто-розсилка вже активна")
+            return
+            
+        self.auto_broadcast_active = True
         
         # Додаємо завдання кожну хвилину
-        schedule.every(1).minutes.do(auto_broadcast_job)
+        trigger = IntervalTrigger(minutes=1)
+        self.scheduler.add_job(
+            self.single_auto_broadcast,
+            trigger=trigger,
+            id='auto_broadcast',
+            replace_existing=True
+        )
         
+        if not self.scheduler.running:
+            self.scheduler.start()
+            
         logger.info("⏰ Авто-розсилка запущена - кожну хвилину")
-        
-        def run_schedule():
-            while not self.stop_schedule:
-                try:
-                    schedule.run_pending()
-                    time.sleep(1)
-                except Exception as e:
-                    logger.error(f"Помилка в run_schedule: {e}")
-                    time.sleep(5)
-        
-        # Запускаємо потік для розкладу
-        self.schedule_thread = threading.Thread(target=run_schedule, daemon=True)
-        self.schedule_thread.start()
 
     async def single_auto_broadcast(self):
         """Одна автоматична розсилка одного повідомлення"""
@@ -189,13 +170,15 @@ class SimpleBroadcastBot:
             # Розсилаємо поточне повідомлення
             for group in self.groups:
                 try:
-                    if message_data.get('has_photo') and message_data.get('photo_path') and os.path.exists(message_data['photo_path']):
-                        with open(message_data['photo_path'], 'rb') as photo:
-                            await bot.send_photo(
-                                chat_id=group['chat_id'],
-                                photo=photo,
-                                caption=message_data['text']
-                            )
+                    if message_data.get('has_photo') and message_data.get('photo_base64'):
+                        # Декодуємо фото з base64
+                        photo_data = base64.b64decode(message_data['photo_base64'])
+                        
+                        await bot.send_photo(
+                            chat_id=group['chat_id'],
+                            photo=photo_data,
+                            caption=message_data['text']
+                        )
                     else:
                         await bot.send_message(
                             chat_id=group['chat_id'],
@@ -244,8 +227,7 @@ class SimpleBroadcastBot:
                 await update.message.reply_text("ℹ️ Авто-розсилка вже активна")
                 return
             
-            self.auto_broadcast_active = True
-            self.start_auto_broadcast()
+            await self.start_auto_broadcast()
             
             await update.message.reply_text(
                 f"✅ Авто-розсилка запущена!\n\n"
@@ -274,8 +256,7 @@ class SimpleBroadcastBot:
                 return
             
             self.auto_broadcast_active = False
-            self.stop_schedule = True
-            schedule.clear()
+            self.scheduler.remove_job('auto_broadcast')
             
             await update.message.reply_text(
                 "🛑 Авто-розсилка зупинена!\n"
@@ -358,9 +339,6 @@ class SimpleBroadcastBot:
             logger.error(f"Помилка в команді /start: {e}")
             await update.message.reply_text("❌ Сталася помилка. Спробуйте ще раз.")
     
-    # Інші методи залишаються незмінними (add_message, handle_text, handle_photo, skip_photo, list_messages, delete_message, broadcast, add_admin, status)
-    # Додайте їх сюди з попереднього коду...
-    
     async def add_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Додавання повідомлення"""
         try:
@@ -419,21 +397,16 @@ class SimpleBroadcastBot:
                     await update.message.reply_text("❌ Спочатку надішліть текст повідомлення!")
                     return
                 
-                # Зберігаємо фото
+                # Зберігаємо фото в base64
                 photo_file = await update.message.photo[-1].get_file()
-                
-                os.makedirs('photos', exist_ok=True)
-                
-                photo_filename = f"photo_{int(datetime.now().timestamp())}_{len(self.messages) + 1}.jpg"
-                photo_path = f"photos/{photo_filename}"
-                
-                await photo_file.download_to_drive(photo_path)
+                photo_bytes = await photo_file.download_as_bytearray()
+                photo_base64 = base64.b64encode(photo_bytes).decode('utf-8')
                 
                 # Зберігаємо повідомлення
                 message_data = {
                     'id': len(self.messages) + 1,
                     'text': text,
-                    'photo_path': photo_path,
+                    'photo_base64': photo_base64,
                     'has_photo': True,
                     'created_date': datetime.now().isoformat(),
                     'created_by': user_id
@@ -479,7 +452,7 @@ class SimpleBroadcastBot:
                 message_data = {
                     'id': len(self.messages) + 1,
                     'text': text,
-                    'photo_path': None,
+                    'photo_base64': None,
                     'has_photo': False,
                     'created_date': datetime.now().isoformat(),
                     'created_by': user_id
@@ -564,14 +537,6 @@ class SimpleBroadcastBot:
                         break
                 
                 if message_to_delete:
-                    # Видаляємо файл фото якщо він існує
-                    if message_to_delete.get('has_photo') and message_to_delete.get('photo_path'):
-                        try:
-                            if os.path.exists(message_to_delete['photo_path']):
-                                os.remove(message_to_delete['photo_path'])
-                        except Exception as e:
-                            logger.error(f"Помилка видалення файлу фото: {e}")
-                    
                     self.messages.remove(message_to_delete)
                     self.save_data('messages')
                     await update.message.reply_text(f"✅ Повідомлення ID {message_id} видалено!")
@@ -625,13 +590,15 @@ class SimpleBroadcastBot:
                 
                 for group_index, group in enumerate(self.groups, 1):
                     try:
-                        if message_data.get('has_photo') and message_data.get('photo_path') and os.path.exists(message_data['photo_path']):
-                            with open(message_data['photo_path'], 'rb') as photo:
-                                await bot.send_photo(
-                                    chat_id=group['chat_id'],
-                                    photo=photo,
-                                    caption=message_data['text']
-                                )
+                        if message_data.get('has_photo') and message_data.get('photo_base64'):
+                            # Декодуємо фото з base64
+                            photo_data = base64.b64decode(message_data['photo_base64'])
+                            
+                            await bot.send_photo(
+                                chat_id=group['chat_id'],
+                                photo=photo_data,
+                                caption=message_data['text']
+                            )
                         else:
                             await bot.send_message(
                                 chat_id=group['chat_id'],
